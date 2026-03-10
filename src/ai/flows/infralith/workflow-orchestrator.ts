@@ -1,0 +1,980 @@
+'use server';
+
+import { WorkflowResult, DevOpsInsight, ModelVersion, ApprovalStep, ConstructionControlGate } from './types';
+import { parseBlueprint } from './blueprint-parser';
+import { checkCompliance } from './compliance-check';
+import { analyzeRisk } from './risk-analysis';
+import { predictCost } from './cost-prediction';
+import { runDevOpsAgent } from './devops-agent';
+import { formatRagPromptContext, retrieveConstructionContext, RagRetrievedContext } from './rag-retrieval';
+import { getServerSession } from 'next-auth/next';
+import { authOptions } from '@/lib/auth';
+import { azureRuntime, getDeploymentOrder } from '@/ai/config/azure-runtime';
+
+const ORCHESTRATOR_VERSION = '3.0.1';
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+const ALLOWED_UPLOAD_EXTENSIONS = new Set(['.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp']);
+const NOT_AVAILABLE_TEXT = 'Not available in provided document data';
+const DEFAULT_REQUIRED_STANDARD_HINTS = ['is 456', 'nbc', 'is 13920'];
+const INDUSTRY_STANDARD_REFERENCES = [
+    {
+        id: 'ISO-19650-1',
+        title: 'ISO 19650-1: Organization and digitization of information about buildings and civil engineering works',
+        scope: 'Information management principles and document-control structure.',
+        sourceUrl: 'https://www.iso.org/standard/65694.html',
+    },
+    {
+        id: 'ISO-31000',
+        title: 'ISO 31000: Risk management guidelines',
+        scope: 'Risk identification, analysis, treatment, and monitoring framework.',
+        sourceUrl: 'https://www.iso.org/iso-31000-risk-management.html',
+    },
+    {
+        id: 'GAO-20-195G',
+        title: 'GAO Cost Estimating and Assessment Guide',
+        scope: 'Best-practice basis-of-estimate and traceable cost documentation.',
+        sourceUrl: 'https://www.gao.gov/products/gao-20-195g',
+    },
+    {
+        id: 'GAO-16-89G',
+        title: 'GAO Schedule Assessment Guide',
+        scope: 'Integrated schedule quality criteria and schedule risk practices.',
+        sourceUrl: 'https://www.gao.gov/products/gao-16-89g',
+    },
+    {
+        id: 'OSHA-SAFETY-MGMT',
+        title: 'OSHA Safety and Health Program Management Guidelines',
+        scope: 'Worker safety planning and hazard-control reporting expectations.',
+        sourceUrl: 'https://www.osha.gov/safety-management',
+    },
+];
+
+const INDUSTRY_RESEARCH_REFERENCES = [
+    {
+        id: 'SCI-REP-2023-REGCHECK',
+        title: 'Automated code compliance checking in BIM projects using NLP and machine learning',
+        sourceUrl: 'https://doi.org/10.1038/s41598-023-38205-6',
+        relevance: 'Supports citation-grounded, explainable compliance findings.',
+    },
+    {
+        id: 'SPRINGER-2022-DOCQUALITY',
+        title: 'A quality framework for design documentation in infrastructure projects',
+        sourceUrl: 'https://doi.org/10.1007/s43452-022-00463-w',
+        relevance: 'Supports completeness-driven document quality gates in reporting.',
+    },
+    {
+        id: 'ALPHA-XIV-2025-EVM',
+        title: 'Comparative analysis of EVM implementation in construction projects',
+        sourceUrl: 'https://doi.org/10.1061/JCCEE5.COENG-15932',
+        relevance: 'Supports progress-control and schedule/cost integration in executive summaries.',
+    },
+];
+const ALLOWED_MIME_BY_EXTENSION: Record<string, string[]> = {
+    '.pdf': ['application/pdf'],
+    '.docx': [
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/zip',
+    ],
+    '.png': ['image/png'],
+    '.jpg': ['image/jpeg'],
+    '.jpeg': ['image/jpeg'],
+    '.webp': ['image/webp'],
+};
+
+type ComplianceAnalysis = Awaited<ReturnType<typeof checkCompliance>> & {
+    analysisStatus?: 'available' | 'not_available';
+    analysisNotes?: string[];
+};
+type RiskAnalysis = Awaited<ReturnType<typeof analyzeRisk>> & {
+    analysisStatus?: 'available' | 'not_available';
+    analysisNotes?: string[];
+};
+type CostAnalysis = Awaited<ReturnType<typeof predictCost>> & {
+    analysisStatus?: 'available' | 'not_available';
+    analysisNotes?: string[];
+};
+
+const toBooleanEnv = (value: string | undefined, fallback: boolean): boolean => {
+    if (typeof value !== 'string') return fallback;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+    return fallback;
+};
+
+const toNumberEnv = (value: string | undefined, fallback: number): number => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const isStrictRealDataMode = (): boolean =>
+    toBooleanEnv(process.env.INFRALITH_STRICT_REAL_DATA, process.env.NODE_ENV === 'production');
+
+const isPartialReportMode = (): boolean =>
+    toBooleanEnv(process.env.INFRALITH_ALLOW_PARTIAL_REPORT, true);
+
+const getRequiredStandardHints = (): string[] => {
+    const raw = String(process.env.INFRALITH_REQUIRED_STANDARD_TERMS || '')
+        .split(',')
+        .map((item) => item.trim().toLowerCase())
+        .filter(Boolean);
+    return raw.length > 0 ? raw : DEFAULT_REQUIRED_STANDARD_HINTS;
+};
+
+function paramHash(): string {
+    const seed = `blueprint-parser-v3|compliance-is456-nbc2016|risk-seismic-v2|cost-capex-india|devops-github-v1|${ORCHESTRATOR_VERSION}`;
+    let h = 0;
+    for (let i = 0; i < seed.length; i++) { h = (h << 5) - h + seed.charCodeAt(i); h |= 0; }
+    return Math.abs(h).toString(16).toUpperCase();
+}
+
+export async function runInfralithWorkflow(formData: FormData): Promise<WorkflowResult> {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.id) {
+        throw new Error("Unauthorized: authentication required.");
+    }
+
+    const role = session.user.role || "Guest";
+    const strictRealData = isStrictRealDataMode();
+    const partialReportMode = isPartialReportMode();
+    const minCoverageScore = clamp(Math.round(toNumberEnv(process.env.INFRALITH_MIN_EXTRACTION_COVERAGE, 70)), 0, 100);
+    const preflightWarnings: string[] = [];
+
+    const startTime = Date.now();
+    const runId = `RUN-${startTime.toString(36).toUpperCase()}`;
+    console.log(`[${runId}] Infralith Orchestrator v${ORCHESTRATOR_VERSION}: Initiating AI analysis...`);
+
+    const input = formData.get('file');
+    if (!(input instanceof File)) throw new Error("No input blueprint file provided.");
+    if (input.size > MAX_UPLOAD_BYTES) {
+        throw new Error("Uploaded file exceeds the 100MB limit.");
+    }
+
+    const originalFileName = input.name || 'uploaded-document';
+    const fileName = originalFileName.toLowerCase();
+    const dotIndex = fileName.lastIndexOf('.');
+    const extension = dotIndex >= 0 ? fileName.slice(dotIndex) : '';
+    if (extension === '.doc') {
+        throw new Error('Legacy .doc files are not supported. Convert to .docx or PDF and try again.');
+    }
+    if (!ALLOWED_UPLOAD_EXTENSIONS.has(extension)) {
+        throw new Error("Unsupported file type. Please upload PDF, DOCX, PNG, JPG, JPEG, or WEBP.");
+    }
+    validateMimeAgainstExtension(extension, input.type);
+    await validateFileSignature(input, extension);
+
+    // 1. Context Generation
+    const blueprint = await parseBlueprint(input);
+    const parsedProjectScope = normalizeConflictText(blueprint?.projectScope, '');
+    if (strictRealData && !partialReportMode && !parsedProjectScope) {
+        throw new Error('Strict real-data mode: project scope could not be extracted from the uploaded document.');
+    }
+    if (!parsedProjectScope) {
+        preflightWarnings.push('Project scope is missing in extracted data. Marked as not available.');
+    }
+    const derivedProjectScope = parsedProjectScope || NOT_AVAILABLE_TEXT;
+    const ragQuery = buildRagQuery(blueprint, originalFileName);
+    if (strictRealData && !partialReportMode && !ragQuery) {
+        throw new Error('Strict real-data mode: unable to build RAG query from extracted blueprint data.');
+    }
+    const ragContext = await retrieveConstructionContext(ragQuery, { top: 10 });
+    try {
+        validateRagContext(ragContext, { strict: strictRealData });
+    } catch (error) {
+        if (!partialReportMode) throw error;
+        preflightWarnings.push(String((error as any)?.message || error));
+    }
+    const ragPromptContext = await formatRagPromptContext(ragContext, 8_500);
+    const allowedCitationIds = ragContext.chunks.map((chunk) => chunk.citationId);
+
+    // 2. Parallel Domain Expert Analysis
+    const analysisWarnings: string[] = [...preflightWarnings];
+    let compliance: ComplianceAnalysis;
+    let risk: RiskAnalysis;
+    let cost: CostAnalysis;
+
+    if (strictRealData && !partialReportMode) {
+        [compliance, risk, cost] = await Promise.all([
+            checkCompliance(JSON.stringify(blueprint), ragPromptContext, {
+                allowedCitationIds,
+                requireCitations: true,
+            }),
+            analyzeRisk(JSON.stringify(blueprint), ragPromptContext, {
+                allowedCitationIds,
+                requireCitations: true,
+            }),
+            predictCost(JSON.stringify(blueprint), ragPromptContext, {
+                allowedCitationIds,
+                requireCitations: true,
+            }),
+        ]);
+    } else {
+        const requireCitations = strictRealData;
+        const [complianceSettled, riskSettled, costSettled] = await Promise.allSettled([
+            checkCompliance(JSON.stringify(blueprint), ragPromptContext, {
+                allowedCitationIds,
+                requireCitations,
+            }),
+            analyzeRisk(JSON.stringify(blueprint), ragPromptContext, {
+                allowedCitationIds,
+                requireCitations,
+            }),
+            predictCost(JSON.stringify(blueprint), ragPromptContext, {
+                allowedCitationIds,
+                requireCitations,
+            }),
+        ]);
+
+        compliance = resolveComplianceAnalysis(complianceSettled, analysisWarnings);
+        risk = resolveRiskAnalysis(riskSettled, analysisWarnings);
+        cost = resolveCostAnalysis(costSettled, analysisWarnings);
+    }
+
+    try {
+        validateSpecialistOutputs({ compliance, risk, cost, strict: strictRealData, allowedCitationIds });
+    } catch (error) {
+        if (!partialReportMode) throw error;
+        analysisWarnings.push(String((error as any)?.message || error));
+    }
+
+    const extractionQuality = buildExtractionQuality(blueprint);
+    if (strictRealData && !partialReportMode && extractionQuality.coverageScore < minCoverageScore) {
+        throw new Error(
+            `Strict real-data mode: extraction coverage ${extractionQuality.coverageScore}% is below minimum ${minCoverageScore}%.`
+        );
+    }
+    if (strictRealData && !partialReportMode && (extractionQuality.criticalMissingFields?.length || 0) > 0) {
+        throw new Error(
+            `Strict real-data mode: critical extracted fields missing (${extractionQuality.criticalMissingFields?.join(', ')}).`
+        );
+    }
+    if (strictRealData && partialReportMode && extractionQuality.coverageScore < minCoverageScore) {
+        analysisWarnings.push(
+            `Extraction coverage ${extractionQuality.coverageScore}% is below strict threshold ${minCoverageScore}%. Final report generated with partial data.`
+        );
+    }
+    if (strictRealData && partialReportMode && (extractionQuality.criticalMissingFields?.length || 0) > 0) {
+        analysisWarnings.push(
+            `Critical extracted fields missing (${extractionQuality.criticalMissingFields?.join(', ')}). Marked as not available in report.`
+        );
+    }
+    if (ragContext.diagnostics.warning) {
+        extractionQuality.warnings.push(`RAG retrieval warning: ${ragContext.diagnostics.warning}`);
+    }
+    if (ragContext.diagnostics.errors.length > 0) {
+        extractionQuality.warnings.push(`RAG retrieval errors: ${ragContext.diagnostics.errors.slice(0, 2).join(' | ')}`);
+    }
+    if (ragContext.chunks.length === 0) {
+        extractionQuality.warnings.push('No external reference chunks retrieved. Report is grounded only on extracted project data.');
+    } else {
+        extractionQuality.warnings.push(`RAG grounded with ${ragContext.chunks.length} retrieved chunk(s) across index(es): ${ragContext.diagnostics.indexesQueried.join(', ') || NOT_AVAILABLE_TEXT}.`);
+    }
+    if (analysisWarnings.length > 0) {
+        extractionQuality.reviewRequired = true;
+        extractionQuality.warnings.push(...analysisWarnings);
+        extractionQuality.warnings.push('Partial AI analysis mode enabled: one or more specialist agents failed; unavailable domains are explicitly marked as not available.');
+    }
+    const materialRows = Array.isArray(blueprint?.materials) ? blueprint.materials : [];
+
+    // 3. Map conflicts with grounded fields from compliance output.
+    const conflicts = (compliance.violations || []).map((v: any) => {
+        const description = normalizeConflictText(v?.description, NOT_AVAILABLE_TEXT);
+        const comment = normalizeConflictText(v?.comment, NOT_AVAILABLE_TEXT);
+        const measuredValue = normalizeConflictText(v?.measuredValue, strictRealData ? NOT_AVAILABLE_TEXT : description);
+        const requiredValue = normalizeConflictText(v?.requiredValue, strictRealData ? NOT_AVAILABLE_TEXT : comment);
+        const location = normalizeConflictText(v?.location, inferConflictLocation(`${description} ${comment}`));
+        const evidence = normalizeConflictText(v?.evidence, '');
+        const confidenceCandidate = Number(v?.confidence);
+        const confidenceScore = Number.isFinite(confidenceCandidate)
+            ? Number(clamp(confidenceCandidate, 0, 1).toFixed(2))
+            : undefined;
+
+        return {
+            riskCategory: inferConflictRiskCategory(v, compliance.overallStatus),
+            regulationRef: normalizeConflictText(v?.ruleId, NOT_AVAILABLE_TEXT),
+            location,
+            requiredValue,
+            measuredValue,
+            evidence,
+            confidenceScore,
+            citationIds: Array.isArray(v?.citationIds)
+                ? v.citationIds.map((id: unknown) => String(id || '').trim()).filter(Boolean)
+                : [],
+        };
+    });
+
+    if (!strictRealData && risk.riskIndex > 70) {
+        conflicts.push({
+            riskCategory: 'Critical',
+            regulationRef: 'SAFETY-OVERRIDE',
+            location: 'Project-Wide',
+            requiredValue: 'Nominal Risk Index (< 50)',
+            measuredValue: `Critical index at ${risk.riskIndex}`,
+            evidence: `Risk analyzer reported project riskIndex=${risk.riskIndex}.`,
+            confidenceScore: 0.9,
+            citationIds: [],
+        });
+    }
+
+    const partialResult: any = {
+        projectScope: derivedProjectScope,
+        riskReport: risk,
+        complianceReport: compliance,
+        conflicts: conflicts,
+        id: runId
+    };
+
+    // 4. Trigger DevOps Agent
+    const devOpsInsight = await runDevOpsAgent(partialResult as WorkflowResult);
+    const complianceAvailable = compliance.analysisStatus !== 'not_available';
+    const riskAvailable = risk.analysisStatus !== 'not_available';
+    const costAvailable = cost.analysisStatus !== 'not_available';
+
+    // 5. Synthesis
+    const insights: DevOpsInsight[] = [
+        {
+            agentId: 'Structural-Auditor-L4',
+            status: !complianceAvailable
+                ? 'Warning'
+                : (compliance.overallStatus === 'Pass' ? 'Optimized' : 'Warning'),
+            message: !complianceAvailable
+                ? 'Compliance analysis unavailable; manual clause-wise audit required.'
+                : compliance.overallStatus === 'Pass'
+                ? 'Full alignment with NBC 2016 detected.'
+                : `Detected ${compliance.violations.length} discrepancies in code compliance.`,
+            actionRequired: !complianceAvailable || compliance.overallStatus !== 'Pass'
+        },
+        devOpsInsight,
+        {
+            agentId: 'Risk-Aggregator-Realtime',
+            status: !riskAvailable
+                ? 'Warning'
+                : (risk.level === 'High' || risk.level === 'Critical' ? 'Warning' : 'Optimized'),
+            message: !riskAvailable
+                ? 'Risk analysis unavailable; manual hazard register and mitigation plan required.'
+                : `Structural stress index at ${risk.riskIndex}%. Mitigation strategies mapped.`,
+            actionRequired: !riskAvailable || risk.riskIndex > 60
+        }
+    ];
+
+    const deploymentOrder = getDeploymentOrder();
+    const deploymentName = deploymentOrder[0] || azureRuntime.routerDeploymentName || 'model-router';
+    const configuredModelName = String(process.env.AZURE_OPENAI_MODEL_NAME || process.env.AZURE_OPENAI_MODEL || '').trim();
+    const llmModel = configuredModelName || deploymentOrder.join(' -> ') || deploymentName;
+
+    const modelVersion: ModelVersion = {
+        orchestratorVersion: ORCHESTRATOR_VERSION,
+        blueprintParserModel: 'azure-doc-intelligence-v4',
+        llmModel,
+        deploymentName,
+        parameterHash: paramHash(),
+        runId,
+    };
+
+    const approvalChain: ApprovalStep[] = [
+        {
+            stepId: `APPR-${runId}-1`,
+            role: 'Supervisor',
+            status: devOpsInsight.actionRequired ? 'rejected' : 'pending',
+        }
+    ];
+
+    const complianceFailures = Array.isArray(compliance.violations) ? compliance.violations.length : 0;
+    const criticalConflicts = conflicts.filter((item: { riskCategory: string }) => item.riskCategory === 'Critical').length;
+    const hasUnavailableDomain = !complianceAvailable || !riskAvailable || !costAvailable;
+    const approvalReadinessScore = hasUnavailableDomain
+        ? undefined
+        : clamp(
+            Math.round(100 - complianceFailures * 11 - risk.riskIndex * 0.55 - criticalConflicts * 3),
+            0,
+            100
+        );
+    const delayImpactDays = hasUnavailableDomain
+        ? undefined
+        : (complianceFailures === 0 && risk.riskIndex < 45
+            ? 0
+            : Math.max(1, Math.round(complianceFailures * 2 + criticalConflicts * 3 + risk.riskIndex / 28)));
+    const redesignRequired = hasUnavailableDomain
+        ? true
+        : (criticalConflicts > 1 || risk.riskIndex >= 65 || extractionQuality.coverageScore < 55);
+    const complianceScore = hasUnavailableDomain
+        ? undefined
+        : clamp(
+            Math.round(((compliance.overallStatus === 'Pass' ? 100 : 70) + (100 - risk.riskIndex)) / 2),
+            0,
+            100
+        );
+    const constructionControlSummary = buildConstructionControlSummary({
+        conflicts,
+        blueprint,
+        compliance,
+        risk,
+        cost,
+        extractionQuality,
+    });
+
+    const result: WorkflowResult = {
+        id: `INF-${Date.now().toString().slice(-6)}`,
+        timestamp: new Date().toISOString(),
+        projectScope: derivedProjectScope,
+        role: role === 'Admin' ? 'Admin' : 'Engineer',
+
+        parsedBlueprint: blueprint,
+        materials: materialRows,
+        complianceReport: compliance,
+        riskReport: risk,
+        costEstimate: cost,
+
+        devOpsInsights: insights,
+        approvalBlockerCount: (devOpsInsight.actionRequired ? 1 : 0) + compliance.violations.filter((v: any) => String(v.ruleId || '').includes('CRITICAL')).length,
+        conflicts,
+
+        costImpactEstimate: costAvailable ? cost.total : undefined,
+        currency: costAvailable ? cost.currency : undefined,
+        complianceScore,
+        approvalReadinessScore,
+        delayImpactDays,
+        redesignRequired,
+        extractionQuality,
+        documentInfo: {
+            fileName: originalFileName,
+            extension,
+            mimeType: input.type || undefined,
+            sizeBytes: input.size,
+        },
+        constructionControlSummary,
+        referenceLibrary: buildReferenceLibrary(ragContext),
+
+        modelVersion,
+        approvalChain,
+        pipelineLatencyMs: Date.now() - startTime,
+    };
+
+    console.log(`[${runId}] Orchestrator: Synthesis Complete in ${result.pipelineLatencyMs}ms via Node.js Native Pipeline.`);
+    return result;
+}
+
+const startsWithBytes = (source: Uint8Array, signature: number[]): boolean => {
+    if (source.length < signature.length) return false;
+    for (let i = 0; i < signature.length; i++) {
+        if (source[i] !== signature[i]) return false;
+    }
+    return true;
+};
+
+const readFileHeader = async (file: File, bytes = 16): Promise<Uint8Array> => {
+    const chunk = file.slice(0, Math.max(4, bytes));
+    return new Uint8Array(await chunk.arrayBuffer());
+};
+
+const validateMimeAgainstExtension = (extension: string, mimeType: string): void => {
+    const normalizedMime = String(mimeType || '').toLowerCase().trim();
+    if (!normalizedMime) return;
+
+    const allowed = ALLOWED_MIME_BY_EXTENSION[extension];
+    if (!Array.isArray(allowed) || allowed.length === 0) return;
+    if (allowed.includes(normalizedMime)) return;
+
+    throw new Error(`File MIME type "${normalizedMime}" does not match extension "${extension}".`);
+};
+
+const validateFileSignature = async (file: File, extension: string): Promise<void> => {
+    const header = await readFileHeader(file, 16);
+    if (header.length < 4) {
+        throw new Error('Uploaded file appears truncated or unreadable.');
+    }
+
+    if (extension === '.pdf' && !startsWithBytes(header, [0x25, 0x50, 0x44, 0x46, 0x2D])) {
+        throw new Error('Invalid PDF signature. Please upload a valid PDF document.');
+    }
+
+    if (extension === '.png' && !startsWithBytes(header, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])) {
+        throw new Error('Invalid PNG signature. Please upload a valid PNG image.');
+    }
+
+    if ((extension === '.jpg' || extension === '.jpeg') && !startsWithBytes(header, [0xFF, 0xD8, 0xFF])) {
+        throw new Error('Invalid JPEG signature. Please upload a valid JPG/JPEG image.');
+    }
+
+    if (extension === '.webp') {
+        const hasRiff = startsWithBytes(header, [0x52, 0x49, 0x46, 0x46]); // RIFF
+        const hasWebp = header.length >= 12 &&
+            header[8] === 0x57 && // W
+            header[9] === 0x45 && // E
+            header[10] === 0x42 && // B
+            header[11] === 0x50; // P
+        if (!hasRiff || !hasWebp) {
+            throw new Error('Invalid WEBP signature. Please upload a valid WEBP image.');
+        }
+    }
+
+    if (extension === '.docx') {
+        const validZipSignature =
+            startsWithBytes(header, [0x50, 0x4B, 0x03, 0x04]) ||
+            startsWithBytes(header, [0x50, 0x4B, 0x05, 0x06]) ||
+            startsWithBytes(header, [0x50, 0x4B, 0x07, 0x08]);
+        if (!validZipSignature) {
+            throw new Error('Invalid DOCX signature. Please upload a valid DOCX document.');
+        }
+    }
+};
+
+const validateRagContext = (
+    context: RagRetrievedContext,
+    options: { strict: boolean }
+) => {
+    if (!options.strict) return;
+
+    const isIgnorableStrictError = (message: string): boolean => {
+        const normalized = String(message || '').toLowerCase();
+        return normalized.startsWith('embedding unavailable:');
+    };
+
+    if (!context.diagnostics.configured) {
+        throw new Error('Strict real-data mode: Azure AI Search is not configured.');
+    }
+    if (context.chunks.length === 0) {
+        throw new Error('Strict real-data mode: no RAG chunks were retrieved for this document.');
+    }
+    const blockingErrors = context.diagnostics.errors.filter((message) => !isIgnorableStrictError(message));
+    if (blockingErrors.length > 0) {
+        throw new Error(`Strict real-data mode: RAG retrieval errors detected (${blockingErrors.join(' | ')}).`);
+    }
+
+    const corpus = context.chunks
+        .map((chunk) => `${chunk.title}\n${chunk.summary}\n${chunk.content}\n${chunk.source}`)
+        .join('\n')
+        .toLowerCase();
+    for (const hint of getRequiredStandardHints()) {
+        if (!corpus.includes(hint)) {
+            throw new Error(`Strict real-data mode: missing retrieved construction standard evidence for "${hint.toUpperCase()}".`);
+        }
+    }
+};
+
+const validateSpecialistOutputs = ({
+    compliance,
+    risk,
+    cost,
+    strict,
+    allowedCitationIds,
+}: {
+    compliance: ComplianceAnalysis;
+    risk: RiskAnalysis;
+    cost: CostAnalysis;
+    strict: boolean;
+    allowedCitationIds: string[];
+}) => {
+    if (!strict) return;
+
+    const allowed = new Set(allowedCitationIds.map((id) => String(id || '').trim()).filter(Boolean));
+    if (allowed.size === 0) {
+        throw new Error('Strict real-data mode: citation map is empty.');
+    }
+
+    const everyCitationGrounded = (ids: unknown): boolean => {
+        if (!Array.isArray(ids) || ids.length === 0) return false;
+        return ids.every((id) => allowed.has(String(id || '').trim()));
+    };
+
+    for (const violation of compliance.violations || []) {
+        if (!everyCitationGrounded((violation as any).citationIds)) {
+            throw new Error(`Strict real-data mode: compliance finding "${violation.ruleId}" has ungrounded citations.`);
+        }
+    }
+
+    const hazards = Array.isArray((risk as any).hazards) ? (risk as any).hazards : [];
+    if (hazards.length === 0) {
+        throw new Error('Strict real-data mode: risk analysis returned no hazards.');
+    }
+    for (const hazard of hazards) {
+        if (!everyCitationGrounded(hazard?.citationIds)) {
+            throw new Error(`Strict real-data mode: risk hazard "${String(hazard?.type || 'Unknown')}" has ungrounded citations.`);
+        }
+    }
+
+    if (!Number.isFinite(Number((cost as any)?.total)) || Number((cost as any)?.total) <= 0) {
+        throw new Error('Strict real-data mode: cost estimate total is invalid.');
+    }
+    if (!Array.isArray((cost as any)?.breakdown) || (cost as any).breakdown.length === 0) {
+        throw new Error('Strict real-data mode: cost estimate breakdown is missing.');
+    }
+    for (const row of (cost as any).breakdown) {
+        if (!everyCitationGrounded(row?.citationIds)) {
+            throw new Error(`Strict real-data mode: cost breakdown "${String(row?.category || 'Unknown')}" has ungrounded citations.`);
+        }
+    }
+    if (!everyCitationGrounded((cost as any).citationIds)) {
+        throw new Error('Strict real-data mode: cost estimate has ungrounded citations.');
+    }
+};
+
+const toErrorMessage = (reason: unknown): string => {
+    if (reason instanceof Error) return reason.message;
+    return String(reason || 'Unknown error');
+};
+
+const resolveComplianceAnalysis = (
+    settled: PromiseSettledResult<ComplianceAnalysis>,
+    warnings: string[]
+): ComplianceAnalysis => {
+    if (settled.status === 'fulfilled') {
+        return {
+            ...settled.value,
+            analysisStatus: 'available',
+        };
+    }
+    const errorMessage = toErrorMessage(settled.reason);
+    console.error('Compliance analysis failed, marking as not available.', settled.reason);
+    warnings.push(`Compliance analysis unavailable: ${errorMessage}`);
+    return {
+        overallStatus: 'Warning',
+        analysisStatus: 'not_available',
+        analysisNotes: [
+            `Compliance analysis failed: ${errorMessage}`,
+            'Perform manual compliance review before approval.',
+        ],
+        violations: [],
+    };
+};
+
+const resolveRiskAnalysis = (
+    settled: PromiseSettledResult<RiskAnalysis>,
+    warnings: string[]
+): RiskAnalysis => {
+    if (settled.status === 'fulfilled') {
+        return {
+            ...settled.value,
+            analysisStatus: 'available',
+        };
+    }
+    const errorMessage = toErrorMessage(settled.reason);
+    console.error('Risk analysis failed, marking as not available.', settled.reason);
+    warnings.push(`Risk analysis unavailable: ${errorMessage}`);
+    return {
+        riskIndex: 0,
+        level: 'Medium',
+        analysisStatus: 'not_available',
+        analysisNotes: [
+            `Risk analysis failed: ${errorMessage}`,
+            'Run manual safety risk workshop before execution decisions.',
+        ],
+        hazards: [
+            {
+                type: 'Analysis Coverage',
+                severity: 'Warning',
+                description: `Risk analysis unavailable. ${errorMessage}`,
+                mitigation: 'Run manual safety risk workshop before execution decisions.',
+                citationIds: [],
+            },
+        ],
+        citationIds: [],
+    };
+};
+
+const resolveCostAnalysis = (
+    settled: PromiseSettledResult<CostAnalysis>,
+    warnings: string[]
+): CostAnalysis => {
+    if (settled.status === 'fulfilled') {
+        return {
+            ...settled.value,
+            analysisStatus: 'available',
+        };
+    }
+    const errorMessage = toErrorMessage(settled.reason);
+    console.error('Cost analysis failed, marking as not available.', settled.reason);
+    warnings.push(`Cost analysis unavailable: ${errorMessage}`);
+    return {
+        total: 0,
+        currency: 'INR',
+        analysisStatus: 'not_available',
+        analysisNotes: [
+            `Cost analysis failed: ${errorMessage}`,
+            'Manual quantity-surveyor estimate is required before budget approval.',
+        ],
+        breakdown: [],
+        duration: NOT_AVAILABLE_TEXT,
+        confidenceScore: 0,
+        assumptions: [
+            `Cost analysis unavailable: ${errorMessage}`,
+            'Manual quantity-surveyor estimate is required before budget approval.',
+        ],
+        citationIds: [],
+    };
+};
+
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+const normalizeConflictText = (value: unknown, fallback: string): string => {
+    const normalized = String(value ?? '').replace(/\s+/g, ' ').trim();
+    return normalized || fallback;
+};
+
+const inferConflictRiskCategory = (
+    violation: any,
+    overallStatus: 'Pass' | 'Warning' | 'Fail'
+): 'Critical' | 'Warning' => {
+    const severity = String(violation?.severity || '').toLowerCase();
+    const ruleId = String(violation?.ruleId || '').toLowerCase();
+    const description = String(violation?.description || '').toLowerCase();
+    const measuredValue = String(violation?.measuredValue || '').toLowerCase();
+
+    if (severity === 'critical') return 'Critical';
+    if (ruleId.includes('critical') || ruleId.includes('13920')) return 'Critical';
+    if (/collapse|life\s*safety|egress|instability|fire/.test(description)) return 'Critical';
+    if (/critical|unsafe/.test(measuredValue)) return 'Critical';
+    return overallStatus === 'Fail' ? 'Critical' : 'Warning';
+};
+
+const hasValue = (value: unknown) => {
+    if (typeof value === 'number') return Number.isFinite(value) && value > 0;
+    if (typeof value === 'string') return value.trim().length > 0;
+    if (Array.isArray(value)) return value.length > 0;
+    return value != null;
+};
+
+const buildRagQuery = (blueprint: any, originalFileName: string): string => {
+    const terms = [
+        asSearchTerm(blueprint?.projectScope),
+        asSearchTerm(blueprint?.seismicZone),
+        asSearchTerm(blueprint?.totalFloors),
+        asSearchTerm(blueprint?.height),
+        asSearchTerm(blueprint?.totalArea),
+        asSearchTerm(originalFileName.replace(/\.[^.]+$/, '')),
+    ].filter(Boolean);
+
+    const materialHints = Array.isArray(blueprint?.materials)
+        ? blueprint.materials
+            .slice(0, 4)
+            .map((item: any) => asSearchTerm(item?.item))
+            .filter(Boolean)
+        : [];
+
+    return [...terms, ...materialHints].join(' ').trim();
+};
+
+const asSearchTerm = (value: unknown): string => {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+    return text.length > 0 ? text : '';
+};
+
+const buildExtractionQuality = (blueprint: any) => {
+    const checks: Array<[string, boolean]> = [
+        ['projectScope', hasValue(blueprint?.projectScope)],
+        ['totalFloors', hasValue(blueprint?.totalFloors)],
+        ['height', hasValue(blueprint?.height)],
+        ['totalArea', hasValue(blueprint?.totalArea)],
+        ['seismicZone', hasValue(blueprint?.seismicZone) && blueprint?.seismicZone !== 'Undefined'],
+        ['materials', hasValue(blueprint?.materials)],
+    ];
+
+    const extractedFields = checks.filter(([, ok]) => ok).map(([field]) => field);
+    const missingFields = checks.filter(([, ok]) => !ok).map(([field]) => field);
+    const coverageScore = Math.round((extractedFields.length / checks.length) * 100);
+    const criticalFields = new Set(['totalFloors', 'height', 'totalArea', 'seismicZone']);
+    const criticalMissingFields = missingFields.filter((field) => criticalFields.has(field));
+    const warnings: string[] = [];
+
+    if (missingFields.length > 0) {
+        warnings.push(`Missing structured extraction: ${missingFields.join(', ')}.`);
+    }
+    if (criticalMissingFields.length > 0) {
+        warnings.push(`Critical document fields missing for reliable compliance: ${criticalMissingFields.join(', ')}.`);
+    }
+    if (!hasValue(blueprint?.materials)) {
+        warnings.push('BOQ rows were not confidently extracted. Upload clearer schedule/quantity pages.');
+    }
+    if (!hasValue(blueprint?.seismicZone) || blueprint?.seismicZone === 'Undefined') {
+        warnings.push('Seismic zone is missing or ambiguous in uploaded document.');
+    }
+    if (coverageScore < 70) {
+        warnings.push('Low extraction coverage. Report should be manually verified before approval decisions.');
+    }
+
+    return {
+        coverageScore,
+        extractedFields,
+        missingFields,
+        criticalMissingFields,
+        reviewRequired: coverageScore < 70 || criticalMissingFields.length > 0,
+        warnings,
+        rawTextLength: Number.isFinite(Number(blueprint?._extractionMeta?.ocrChars))
+            ? Number(blueprint._extractionMeta.ocrChars)
+            : undefined,
+    };
+};
+
+const gateStatus = (
+    condition: { critical?: boolean; warning?: boolean }
+): 'Pass' | 'Warning' | 'Critical' => {
+    if (condition.critical) return 'Critical';
+    if (condition.warning) return 'Warning';
+    return 'Pass';
+};
+
+const describeTopConflictRefs = (conflicts: WorkflowResult['conflicts']): string => {
+    const refs = conflicts
+        .map((conflict) => String(conflict?.regulationRef || '').trim())
+        .filter(Boolean)
+        .slice(0, 3);
+    return refs.length > 0 ? refs.join(', ') : 'No regulation references detected';
+};
+
+const buildConstructionControlSummary = ({
+    conflicts,
+    blueprint,
+    compliance,
+    risk,
+    cost,
+    extractionQuality,
+}: {
+    conflicts: WorkflowResult['conflicts'];
+    blueprint: any;
+    compliance: any;
+    risk: any;
+    cost: any;
+    extractionQuality: ReturnType<typeof buildExtractionQuality>;
+}): NonNullable<WorkflowResult['constructionControlSummary']> => {
+    const criticalConflicts = conflicts.filter((conflict) => conflict.riskCategory === 'Critical').length;
+    const warningConflicts = Math.max(0, conflicts.length - criticalConflicts);
+    const complianceUnavailable = String(compliance?.analysisStatus || '').toLowerCase() === 'not_available';
+    const riskUnavailable = String(risk?.analysisStatus || '').toLowerCase() === 'not_available';
+    const costUnavailable = String(cost?.analysisStatus || '').toLowerCase() === 'not_available';
+    const hasCostBreakdown = Array.isArray(cost?.breakdown) && cost.breakdown.length > 0;
+    const hasMaterials = Array.isArray(blueprint?.materials) && blueprint.materials.length > 0;
+    const hazards = Array.isArray(risk?.hazards) ? risk.hazards.length : 0;
+    const missingFields = extractionQuality.missingFields.length;
+    const criticalMissing = extractionQuality.criticalMissingFields?.length || 0;
+
+    const gates: ConstructionControlGate[] = [
+        {
+            key: 'progress',
+            title: 'Progress Control',
+            requirement: 'Track current completion, pending activities, and updated forecast every report cycle.',
+            status: gateStatus({
+                critical: extractionQuality.coverageScore < 55,
+                warning: extractionQuality.coverageScore < 75,
+            }),
+            evidence: `Coverage ${extractionQuality.coverageScore}% | Floors ${blueprint?.totalFloors ?? NOT_AVAILABLE_TEXT} | Area ${blueprint?.totalArea ?? NOT_AVAILABLE_TEXT} sq.m`,
+            action: extractionQuality.coverageScore < 75
+                ? 'Attach clearer drawings and baseline schedule snapshot for planned vs actual tracking.'
+                : 'Continue periodic progress updates with baseline comparison.',
+        },
+        {
+            key: 'cost',
+            title: 'Cost Control',
+            requirement: 'Report certified total cost, category breakdown, and duration outlook.',
+            status: gateStatus({
+                critical: costUnavailable || !Number.isFinite(Number(cost?.total)) || Number(cost?.total) <= 0,
+                warning: !hasCostBreakdown,
+            }),
+            evidence: costUnavailable
+                ? `Cost analysis ${NOT_AVAILABLE_TEXT}.`
+                : `CAPEX ${Number(cost?.total || 0).toLocaleString()} ${cost?.currency || 'INR'} | Breakdown rows ${hasCostBreakdown ? cost.breakdown.length : 0} | Duration ${cost?.duration || NOT_AVAILABLE_TEXT}`,
+            action: (costUnavailable || !Number.isFinite(Number(cost?.total)) || Number(cost?.total) <= 0 || !hasCostBreakdown)
+                ? 'Add signed BOQ rates and package-wise cost split before procurement decisions. Mark unavailable rows explicitly.'
+                : 'Maintain variance tracking against sanctioned estimate.',
+        },
+        {
+            key: 'quality',
+            title: 'Quality Control',
+            requirement: 'Maintain material specifications, test evidence, and acceptance status in each cycle.',
+            status: gateStatus({
+                critical: !hasMaterials || criticalMissing >= 2,
+                warning: !hasMaterials || missingFields > 0,
+            }),
+            evidence: `Materials extracted ${hasMaterials ? blueprint.materials.length : 0} | Missing fields ${missingFields} (critical ${criticalMissing})`,
+            action: (!hasMaterials || missingFields > 0)
+                ? 'Upload schedule/test-sheet pages and map each key material to spec-grade evidence.'
+                : 'Continue QC traceability with batch and test references.',
+        },
+        {
+            key: 'safety',
+            title: 'Safety & Risk',
+            requirement: 'Monitor risk index, active hazards, and mandatory site safety controls.',
+            status: gateStatus({
+                critical: !riskUnavailable && (Number(risk?.riskIndex || 0) >= 70 || String(risk?.level || '').toLowerCase() === 'critical'),
+                warning: riskUnavailable || Number(risk?.riskIndex || 0) >= 50 || String(risk?.level || '').toLowerCase() === 'high',
+            }),
+            evidence: riskUnavailable
+                ? `Risk analysis ${NOT_AVAILABLE_TEXT}.`
+                : `Risk index ${risk?.riskIndex ?? NOT_AVAILABLE_TEXT} (${risk?.level || NOT_AVAILABLE_TEXT}) | Hazards ${hazards}`,
+            action: riskUnavailable
+                ? 'Run manual risk workshop and upload hazard register evidence.'
+                : Number(risk?.riskIndex || 0) >= 50
+                ? 'Issue mitigation owners with due dates and verify closure in next cycle.'
+                : 'Keep routine toolbox, hazard log, and permit controls active.',
+        },
+        {
+            key: 'compliance',
+            title: 'Code Compliance',
+            requirement: 'List code references, observed deviations, and closure actions with confidence.',
+            status: gateStatus({
+                critical: criticalConflicts > 0,
+                warning: warningConflicts > 0 || complianceUnavailable,
+            }),
+            evidence: complianceUnavailable
+                ? `Compliance analysis ${NOT_AVAILABLE_TEXT}.`
+                : `Critical ${criticalConflicts} | Warning ${warningConflicts} | Refs ${describeTopConflictRefs(conflicts)}`,
+            action: complianceUnavailable
+                ? 'Execute manual clause-by-clause compliance audit before approvals.'
+                : criticalConflicts > 0
+                ? 'Close critical code deviations before execution approvals.'
+                : warningConflicts > 0
+                    ? 'Track warnings to closure with responsible engineer.'
+                    : 'No active code non-conformance detected.',
+        },
+        {
+            key: 'document-control',
+            title: 'Document Control',
+            requirement: 'Ensure latest revision set, readable sheets, and traceable evidence lines.',
+            status: gateStatus({
+                critical: extractionQuality.reviewRequired && criticalMissing > 0,
+                warning: extractionQuality.reviewRequired,
+            }),
+            evidence: `ReviewRequired ${extractionQuality.reviewRequired ? 'Yes' : 'No'} | OCR chars ${extractionQuality.rawTextLength ?? NOT_AVAILABLE_TEXT} | Missing ${missingFields}`,
+            action: extractionQuality.reviewRequired
+                ? 'Re-upload high-resolution latest revision with explicit labels and stamped tables.'
+                : 'Document package is acceptable for AI-assisted reporting.',
+        },
+    ];
+
+    return {
+        reportingStandard: 'Control matrix aligned with ISO 19650 information management, ISO 31000 risk method, and auditable cost/schedule assurance practices.',
+        generatedAt: new Date().toISOString(),
+        gates,
+    };
+};
+
+const buildReferenceLibrary = (
+    context: RagRetrievedContext
+): NonNullable<WorkflowResult['referenceLibrary']> => {
+    const retrievedCitations = (context?.chunks || []).map((chunk) => ({
+        citationId: chunk.citationId,
+        title: chunk.title || NOT_AVAILABLE_TEXT,
+        source: chunk.source || NOT_AVAILABLE_TEXT,
+        collection: chunk.collection || NOT_AVAILABLE_TEXT,
+        score: Number.isFinite(Number(chunk.rerankerScore))
+            ? Number(chunk.rerankerScore)
+            : (Number.isFinite(Number(chunk.score)) ? Number(chunk.score) : undefined),
+        createdAt: chunk.createdAt || undefined,
+    }));
+
+    return {
+        standards: INDUSTRY_STANDARD_REFERENCES,
+        researchPapers: INDUSTRY_RESEARCH_REFERENCES,
+        retrievedCitations,
+    };
+};
+
+const inferConflictLocation = (description: string) => {
+    const text = String(description || '');
+    const grid = text.match(/\bgrid\s*[a-z0-9-]+\b/i)?.[0];
+    if (grid) return grid.toUpperCase();
+    if (/stair|egress|exit/i.test(text)) return 'Egress / Stair Core';
+    if (/foundation|footing|soil|settlement/i.test(text)) return 'Foundation Zone';
+    if (/beam|column|slab|wall|truss/i.test(text)) return 'Primary Structural Frame';
+    if (/fire|smoke|hydrant|sprinkler/i.test(text)) return 'Fire Safety System';
+    return NOT_AVAILABLE_TEXT;
+};
