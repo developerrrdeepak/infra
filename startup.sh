@@ -3,26 +3,30 @@ set -eu
 
 echo "Starting Infralith on Azure App Service..."
 
-if [ -f "server.js" ]; then
-  echo "Using packaged standalone server from deployment root."
-  exec node server.js
-fi
+PORT=${PORT:-3000}
+HOSTNAME=${HOSTNAME:-0.0.0.0}
 
 if [ -f ".next/standalone/server.js" ]; then
+  echo "Setting up standalone Next.js server..."
+  
+  mkdir -p ".next/standalone/.next"
+  
   if [ -d ".next/static" ]; then
-    mkdir -p ".next/standalone/.next"
     rm -rf ".next/standalone/.next/static"
     cp -r ".next/static" ".next/standalone/.next/static"
+    echo "Copied static assets"
   fi
 
   if [ -d "public" ]; then
     rm -rf ".next/standalone/public"
     cp -r "public" ".next/standalone/public"
+    echo "Copied public assets"
   fi
 
-  echo "Using standalone Next.js server build."
-  exec node .next/standalone/server.js
+  cd ".next/standalone"
+  echo "Starting server on $HOSTNAME:$PORT"
+  exec node server.js
 fi
 
-echo "Standalone build not found; falling back to npm start."
-exec npm run start
+echo "ERROR: Standalone build not found"
+exit 1
